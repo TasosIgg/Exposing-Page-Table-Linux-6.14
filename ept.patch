@@ -1,0 +1,660 @@
+From acd7e2f1d7da01637cf3facd1a048623289728e8 Mon Sep 17 00:00:00 2001
+From: Tasos Igglezakis <tasosigglezakis@gmail.com>
+Date: Sat, 7 Feb 2026 13:36:55 +0200
+Subject: [PATCH] mm: add EPT (Exposed Page Tables) subsystem
+
+This patch introduces the EPT subsystem which exposes process page
+tables to userspace via /dev/ept.
+
+Signed-off-by: Tasos Igglezakis <tasosigglezakis@gmail.com>
+---
+ MAINTAINERS              |   7 ++
+ include/linux/ept.h      |   8 ++
+ include/linux/hugetlb.h  |   2 +-
+ include/linux/mm.h       |   8 +-
+ include/linux/mm_types.h |   3 +
+ mm/Makefile              |   3 +-
+ mm/debug_vm_pgtable.c    |   2 +-
+ mm/ept.c                 | 209 +++++++++++++++++++++++++++++++++++++++
+ mm/filemap.c             |   2 +-
+ mm/gup.c                 |   2 +-
+ mm/internal.h            |   3 +-
+ mm/memory.c              |  97 +++++++++++++-----
+ mm/migrate_device.c      |   2 +-
+ mm/mprotect.c            |   8 +-
+ mm/mremap.c              |   2 +-
+ mm/pagewalk.c            |   2 +-
+ mm/userfaultfd.c         |   6 +-
+ 17 files changed, 322 insertions(+), 44 deletions(-)
+ create mode 100644 include/linux/ept.h
+ create mode 100644 mm/ept.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 00e94bec4..6c729d6a9 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8545,6 +8545,13 @@ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/kristoffer/linux-hpc.git
+ F:	drivers/video/fbdev/s1d13xxxfb.c
+ F:	include/video/s1d13xxxfb.h
+ 
++EPT (EXPOSED PAGE TABLES)
++M:	Skotis Thanasis <skotisthanasis@gmail.com>
++L:	linux-mm@kvack.org
++S:	Maintained
++F:	include/linux/ept.h
++F:	mm/ept.c
++
+ EROFS FILE SYSTEM
+ M:	Gao Xiang <xiang@kernel.org>
+ M:	Chao Yu <chao@kernel.org>
+diff --git a/include/linux/ept.h b/include/linux/ept.h
+new file mode 100644
+index 000000000..67e63f9ee
+--- /dev/null
++++ b/include/linux/ept.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_EPT_H
++#define _LINUX_EPT_H
++
++#include <linux/mm_types.h>
++
++
++#endif
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 76a75ec03..6aae9ba0c 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -189,7 +189,7 @@ static inline pte_t *pte_offset_huge(pmd_t *pmd, unsigned long address)
+ static inline pte_t *pte_alloc_huge(struct mm_struct *mm, pmd_t *pmd,
+ 				    unsigned long address)
+ {
+-	return pte_alloc(mm, pmd) ? NULL : pte_offset_huge(pmd, address);
++	return pte_alloc(mm, pmd, address) ? NULL : pte_offset_huge(pmd, address);
+ }
+ #endif
+ 
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 1f80badda..2c3247c62 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2845,7 +2845,7 @@ static inline void mm_inc_nr_ptes(struct mm_struct *mm) {}
+ static inline void mm_dec_nr_ptes(struct mm_struct *mm) {}
+ #endif
+ 
+-int __pte_alloc(struct mm_struct *mm, pmd_t *pmd);
++int __pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address);
+ int __pte_alloc_kernel(pmd_t *pmd);
+ 
+ #if defined(CONFIG_MMU)
+@@ -3066,13 +3066,13 @@ pte_t *pte_offset_map_rw_nolock(struct mm_struct *mm, pmd_t *pmd,
+ 	pte_unmap(pte);					\
+ } while (0)
+ 
+-#define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && __pte_alloc(mm, pmd))
++#define pte_alloc(mm, pmd, address) (unlikely(pmd_none(*(pmd))) && __pte_alloc(mm, pmd, address))
+ 
+ #define pte_alloc_map(mm, pmd, address)			\
+-	(pte_alloc(mm, pmd) ? NULL : pte_offset_map(pmd, address))
++	(pte_alloc(mm, pmd, address) ? NULL : pte_offset_map(pmd, address))
+ 
+ #define pte_alloc_map_lock(mm, pmd, address, ptlp)	\
+-	(pte_alloc(mm, pmd) ?			\
++	(pte_alloc(mm, pmd, address) ?			\
+ 		 NULL : pte_offset_map_lock(mm, pmd, address, ptlp))
+ 
+ #define pte_alloc_kernel(pmd, address)			\
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 0234f14f2..b1404c922 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -998,6 +998,9 @@ struct mm_struct {
+ #ifdef CONFIG_MMU_NOTIFIER
+ 		struct mmu_notifier_subscriptions *notifier_subscriptions;
+ #endif
++
++struct vm_area_struct *ept_vma;
++
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !defined(CONFIG_SPLIT_PMD_PTLOCKS)
+ 		pgtable_t pmd_huge_pte; /* protected by page_table_lock */
+ #endif
+diff --git a/mm/Makefile b/mm/Makefile
+index 850386a67..d678a09ce 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -37,7 +37,8 @@ mmu-y			:= nommu.o
+ mmu-$(CONFIG_MMU)	:= highmem.o memory.o mincore.o \
+ 			   mlock.o mmap.o mmu_gather.o mprotect.o mremap.o \
+ 			   msync.o page_vma_mapped.o pagewalk.o \
+-			   pgtable-generic.o rmap.o vmalloc.o vma.o
++			   pgtable-generic.o rmap.o vmalloc.o vma.o \
++			   ept.o
+ 
+ 
+ ifdef CONFIG_CROSS_MEMORY_ATTACH
+diff --git a/mm/debug_vm_pgtable.c b/mm/debug_vm_pgtable.c
+index bc748f700..68c1af9b7 100644
+--- a/mm/debug_vm_pgtable.c
++++ b/mm/debug_vm_pgtable.c
+@@ -1246,7 +1246,7 @@ static int __init init_args(struct pgtable_debug_args *args)
+ 	args->start_pmdp = pmd_offset(args->pudp, 0UL);
+ 	WARN_ON(!args->start_pmdp);
+ 
+-	if (pte_alloc(args->mm, args->pmdp)) {
++	if (pte_alloc(args->mm, args->pmdp, args->vaddr)) {
+ 		pr_err("Failed to allocate pte entries\n");
+ 		ret = -ENOMEM;
+ 		goto error;
+diff --git a/mm/ept.c b/mm/ept.c
+new file mode 100644
+index 000000000..0f7fe8007
+--- /dev/null
++++ b/mm/ept.c
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/miscdevice.h>
++#include <linux/capability.h>
++#include <linux/pgtable.h>
++#include <linux/sched.h>
++#include <linux/highmem.h>
++#include <linux/pagemap.h>
++#include <linux/swap.h>
++#include <linux/printk.h>
++#include <linux/uaccess.h>
++#include <linux/huge_mm.h>
++#include <linux/hugetlb.h>
++
++#include <linux/ept.h>
++
++#define EPT_NAME "ept"
++
++// Compatibility wrappers
++#ifndef my_zero_pfn
++#define my_zero_pfn() page_to_pfn(ZERO_PAGE(0))
++#endif
++
++/**
++ * ept_fault - Handle page fault for EPT mapping
++ * @vmf: Fault information
++ *
++ * Maps the physical page containing the PTE for a given virtual address
++ * into userspace. Returns zero page if the PTE doesn't exist or is invalid.
++ */
++static vm_fault_t ept_fault(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	unsigned long fault_addr = vmf->address;
++	unsigned long fault_page = fault_addr & PAGE_MASK;
++	unsigned long index;
++	unsigned long target_addr;
++	struct mm_struct *mm = vma->vm_mm;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *ptep;
++	unsigned long pfn;
++	unsigned long pte_page_vaddr;
++	unsigned long vpn_offset;
++
++	if (WARN_ON_ONCE(fault_addr < vma->vm_start ||
++			 fault_addr >= vma->vm_end))
++		return VM_FAULT_SIGBUS;
++
++	if (!mm)
++		return VM_FAULT_SIGBUS;
++
++	/*
++	 * Calculate the target virtual address.
++	 * vm_pgoff is in PAGE_SIZE units.
++	 */
++	index = (fault_addr - vma->vm_start) >> PAGE_SHIFT;
++	index *= (PAGE_SIZE / sizeof(unsigned long));
++	vpn_offset = vma->vm_pgoff * (PAGE_SIZE / sizeof(unsigned long));
++	target_addr = (index + vpn_offset) << PAGE_SHIFT;
++
++	/* Walk the page table hierarchy */
++	pgd = pgd_offset(mm, target_addr);
++	if (pgd_none(*pgd) || pgd_bad(*pgd))
++		goto map_zero;
++
++	p4d = p4d_offset(pgd, target_addr);
++	if (p4d_none(*p4d) || p4d_bad(*p4d))
++		goto map_zero;
++
++	pud = pud_offset(p4d, target_addr);
++	if (pud_none(*pud) || pud_bad(*pud))
++		goto map_zero;
++
++#ifdef CONFIG_HUGETLB_PAGE
++	if (pud_trans_huge(*pud) || pud_devmap(*pud))
++#else
++	if (pud_trans_huge(*pud) || pud_devmap(*pud))
++#endif
++		goto map_zero;
++
++	pmd = pmd_offset(pud, target_addr);
++	if (pmd_none(*pmd) || pmd_bad(*pmd))
++		goto map_zero;
++
++#ifdef CONFIG_HUGETLB_PAGE
++	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
++#else
++	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
++#endif
++		goto map_zero;
++
++	/*
++	 * Get the PTE page address.
++	 * Use pte_offset_map() which is safe.
++	 */
++	ptep = pte_offset_map(pmd, target_addr);
++	if (!ptep)
++		goto map_zero;
++
++	pte_page_vaddr = (unsigned long)ptep & PAGE_MASK;
++	pte_unmap(ptep);
++
++	if (!virt_addr_valid(pte_page_vaddr)) {
++		pr_warn_once("EPT: Invalid kernel virtual address for PTE page\n");
++		goto map_zero;
++	}
++
++	/*
++	 * Convert kernel virtual address to PFN.
++	 * This is the physical page containing the PTE entries.
++	 */
++	pfn = __pa(pte_page_vaddr) >> PAGE_SHIFT;
++
++	return vmf_insert_pfn(vma, fault_page, pfn);
++
++map_zero:
++	pfn = my_zero_pfn();
++	return vmf_insert_pfn(vma, fault_page, pfn);
++}
++
++/**
++ * ept_close - Cleanup when VMA is closed
++ * @vma: VMA being closed
++ */
++static void ept_close(struct vm_area_struct *vma)
++{
++	struct mm_struct *mm = vma->vm_mm;
++
++	if (mm && READ_ONCE(mm->ept_vma) == vma)
++		WRITE_ONCE(mm->ept_vma, NULL);
++}
++
++static const struct vm_operations_struct ept_vm_ops = {
++	.fault = ept_fault,
++	.close = ept_close,
++};
++
++/**
++ * ept_mmap - Map EPT into userspace
++ * @file: File being mapped
++ * @vma: VMA for the mapping
++ */
++static int ept_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	struct mm_struct *mm = current->mm;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	if (vma->vm_flags & VM_WRITE)
++		return -EPERM;
++
++	vm_flags_clear(vma, VM_WRITE | VM_MAYWRITE);
++
++	if (READ_ONCE(mm->ept_vma))
++		return -EBUSY;
++
++	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND |
++				VM_DONTDUMP | VM_DONTCOPY);
++
++	vma->vm_ops = &ept_vm_ops;
++	WRITE_ONCE(mm->ept_vma, vma);
++
++	return 0;
++}
++
++static const struct file_operations ept_fops = {
++	.owner  = THIS_MODULE,
++	.mmap   = ept_mmap,
++	.llseek = noop_llseek,
++};
++
++static struct miscdevice ept_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name  = EPT_NAME,
++	.fops  = &ept_fops,
++	.mode  = 0400,
++};
++
++static int __init ept_init(void)
++{
++	int ret = misc_register(&ept_dev);
++
++	if (ret)
++		pr_err(EPT_NAME ": misc_register failed (%d)\n", ret);
++	else
++		pr_info(EPT_NAME ": registered /dev/%s\n", EPT_NAME);
++
++	return ret;
++}
++
++static void __exit ept_exit(void)
++{
++	misc_deregister(&ept_dev);
++	pr_info(EPT_NAME ": unregistered\n");
++}
++
++module_init(ept_init);
++module_exit(ept_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("User-space exposed flat page table (EPT)");
++MODULE_AUTHOR("Your Name");
+diff --git a/mm/filemap.c b/mm/filemap.c
+index e9404290f..4e946b681 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3541,7 +3541,7 @@ static bool filemap_map_pmd(struct vm_fault *vmf, struct folio *folio,
+ 	}
+ 
+ 	if (pmd_none(*vmf->pmd) && vmf->prealloc_pte)
+-		pmd_install(mm, vmf->pmd, &vmf->prealloc_pte);
++		pmd_install(mm, vmf->pmd, &vmf->prealloc_pte, vmf->address);
+ 
+ 	return false;
+ }
+diff --git a/mm/gup.c b/mm/gup.c
+index 3883b3077..f60b147ee 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -994,7 +994,7 @@ static struct page *follow_pmd_mask(struct vm_area_struct *vma,
+ 		spin_unlock(ptl);
+ 		split_huge_pmd(vma, pmd, address);
+ 		/* If pmd was left empty, stuff a page table in there quickly */
+-		return pte_alloc(mm, pmd) ? ERR_PTR(-ENOMEM) :
++		return pte_alloc(mm, pmd, address) ? ERR_PTR(-ENOMEM) :
+ 			follow_page_pte(vma, address, pmd, flags, &ctx->pgmap);
+ 	}
+ 	page = follow_huge_pmd(vma, address, pmd, flags, ctx);
+diff --git a/mm/internal.h b/mm/internal.h
+index 20b353593..3782eadc2 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -385,7 +385,8 @@ void folio_activate(struct folio *folio);
+ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 		   struct vm_area_struct *start_vma, unsigned long floor,
+ 		   unsigned long ceiling, bool mm_wr_locked);
+-void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte);
++void ept_invalidate(struct mm_struct *mm, unsigned long address);
++bool pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte, unsigned long address);
+ 
+ struct zap_details;
+ void unmap_page_range(struct mmu_gather *tlb,
+diff --git a/mm/memory.c b/mm/memory.c
+index fb7b8dc75..9a9e61ab5 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -76,6 +76,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
+ #include <linux/sched/sysctl.h>
++#include <linux/ept.h>
+ 
+ #include <trace/events/kmem.h>
+ 
+@@ -415,41 +416,89 @@ void free_pgtables(struct mmu_gather *tlb, struct ma_state *mas,
+ 	} while (vma);
+ }
+ 
+-void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte)
++void ept_invalidate(struct mm_struct *mm, unsigned long address)
+ {
+-	spinlock_t *ptl = pmd_lock(mm, pmd);
+ 
+-	if (likely(pmd_none(*pmd))) {	/* Has another populated it ? */
++	struct vm_area_struct *vma;
++	unsigned long vpn, ept_fault_addr, ept_page_addr;
++
++	if (!mm)
++		return;
++
++	vma = READ_ONCE(mm->ept_vma);
++	if (!vma)
++		return;
++
++	/* Compute EPT virtual address */
++	vpn = address >> PAGE_SHIFT;
++	ept_fault_addr = vma->vm_start + vpn * sizeof(unsigned long);
++
++	if (ept_fault_addr < vma->vm_start || ept_fault_addr >= vma->vm_end)
++		return;
++
++	ept_page_addr = ept_fault_addr & PAGE_MASK;
++
++	/* Avoid deadlock */
++	if (!mmap_read_trylock(mm))
++		return;
++
++	/* Re-check after lock */
++	vma = READ_ONCE(mm->ept_vma);
++	if (!vma)
++		goto unlock;
++
++	/* Unmap the EPT metadata page */
++	zap_vma_ptes(vma, ept_page_addr, PAGE_SIZE);
++
++unlock:
++	mmap_read_unlock(mm);
++}
++EXPORT_SYMBOL_GPL(ept_invalidate);
++
++
++
++bool pmd_install(struct mm_struct *mm,
++		pmd_t *pmd,
++		pgtable_t *pte,
++		unsigned long address)
++{
++	spinlock_t *ptl;
++	bool installed = false;
++
++	ptl = pmd_lock(mm, pmd);
++
++	if (likely(pmd_none(*pmd))) {
+ 		mm_inc_nr_ptes(mm);
+-		/*
+-		 * Ensure all pte setup (eg. pte page lock and page clearing) are
+-		 * visible before the pte is made visible to other CPUs by being
+-		 * put into page tables.
+-		 *
+-		 * The other side of the story is the pointer chasing in the page
+-		 * table walking code (when walking the page table without locking;
+-		 * ie. most of the time). Fortunately, these data accesses consist
+-		 * of a chain of data-dependent loads, meaning most CPUs (alpha
+-		 * being the notable exception) will already guarantee loads are
+-		 * seen in-order. See the alpha page table accessors for the
+-		 * smp_rmb() barriers in page table walking code.
+-		 */
+-		smp_wmb(); /* Could be smp_wmb__xxx(before|after)_spin_lock */
++		smp_wmb();
+ 		pmd_populate(mm, pmd, *pte);
+ 		*pte = NULL;
++		installed = true;
+ 	}
++
+ 	spin_unlock(ptl);
++
++	/*
++	 * Call ept_invalidate AFTER releasing the spinlock.
++	 * It's safe to call even if no EPT mapping exists - it will just return.
++	 */
++	if (installed)
++		ept_invalidate(mm, address);
++
++	return installed;
+ }
+ 
+-int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
++
++int __pte_alloc(struct mm_struct *mm,
++		       pmd_t *pmd,
++		       unsigned long address)
+ {
+ 	pgtable_t new = pte_alloc_one(mm);
+ 	if (!new)
+ 		return -ENOMEM;
+ 
+-	pmd_install(mm, pmd, &new);
+-	if (new)
++	if (!pmd_install(mm, pmd, &new, address))
+ 		pte_free(mm, new);
++
+ 	return 0;
+ }
+ 
+@@ -2211,7 +2260,7 @@ static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
+ 
+ 	/* Allocate the PTE if necessary; takes PMD lock once only. */
+ 	ret = -ENOMEM;
+-	if (pte_alloc(mm, pmd))
++	if (pte_alloc(mm, pmd, addr))
+ 		goto out;
+ 
+ 	while (pages_to_write_in_pmd) {
+@@ -4856,7 +4905,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	 * Use pte_alloc() instead of pte_alloc_map(), so that OOM can
+ 	 * be distinguished from a transient failure of pte_offset_map().
+ 	 */
+-	if (pte_alloc(vma->vm_mm, vmf->pmd))
++	if (pte_alloc(vma->vm_mm, vmf->pmd, vmf->address))
+ 		return VM_FAULT_OOM;
+ 
+ 	/* Use the zero-page for reads */
+@@ -5214,8 +5263,8 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
+ 		}
+ 
+ 		if (vmf->prealloc_pte)
+-			pmd_install(vma->vm_mm, vmf->pmd, &vmf->prealloc_pte);
+-		else if (unlikely(pte_alloc(vma->vm_mm, vmf->pmd)))
++			pmd_install(vma->vm_mm, vmf->pmd, &vmf->prealloc_pte, vmf->address);
++		else if (unlikely(pte_alloc(vma->vm_mm, vmf->pmd, vmf->address)))
+ 			return VM_FAULT_OOM;
+ 	}
+ 
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+index 5bd888223..2e2d6ecac 100644
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -598,7 +598,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
+ 		goto abort;
+ 	if (pmd_trans_huge(*pmdp) || pmd_devmap(*pmdp))
+ 		goto abort;
+-	if (pte_alloc(mm, pmdp))
++	if (pte_alloc(mm, pmdp, addr))
+ 		goto abort;
+ 	if (unlikely(anon_vma_prepare(vma)))
+ 		goto abort;
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 516b1d847..791353ae2 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -332,11 +332,11 @@ pgtable_populate_needed(struct vm_area_struct *vma, unsigned long cp_flags)
+  * allocation failures during page faults by kicking OOM and returning
+  * error.
+  */
+-#define  change_pmd_prepare(vma, pmd, cp_flags)				\
++#define  change_pmd_prepare(vma, pmd, addr, cp_flags)				\
+ 	({								\
+ 		long err = 0;						\
+ 		if (unlikely(pgtable_populate_needed(vma, cp_flags))) {	\
+-			if (pte_alloc(vma->vm_mm, pmd))			\
++			if (pte_alloc(vma->vm_mm, pmd, addr))			\
+ 				err = -ENOMEM;				\
+ 		}							\
+ 		err;							\
+@@ -374,7 +374,7 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ again:
+ 		next = pmd_addr_end(addr, end);
+ 
+-		ret = change_pmd_prepare(vma, pmd, cp_flags);
++		ret = change_pmd_prepare(vma, pmd, addr, cp_flags);
+ 		if (ret) {
+ 			pages = ret;
+ 			break;
+@@ -393,7 +393,7 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 				 * cleared; make sure pmd populated if
+ 				 * necessary, then fall-through to pte level.
+ 				 */
+-				ret = change_pmd_prepare(vma, pmd, cp_flags);
++				ret = change_pmd_prepare(vma, pmd, addr, cp_flags);
+ 				if (ret) {
+ 					pages = ret;
+ 					break;
+diff --git a/mm/mremap.c b/mm/mremap.c
+index cff7f552f..7208e16df 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -674,7 +674,7 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
+ 		}
+ 		if (pmd_none(*old_pmd))
+ 			continue;
+-		if (pte_alloc(new_vma->vm_mm, new_pmd))
++		if (pte_alloc(new_vma->vm_mm, new_pmd, new_addr))
+ 			break;
+ 		if (move_ptes(vma, old_pmd, old_addr, old_addr + extent,
+ 			      new_vma, new_pmd, new_addr, need_rmap_locks) < 0)
+diff --git a/mm/pagewalk.c b/mm/pagewalk.c
+index e478777c8..55cd594cb 100644
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -111,7 +111,7 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+ 		next = pmd_addr_end(addr, end);
+ 		if (pmd_none(*pmd)) {
+ 			if (has_install)
+-				err = __pte_alloc(walk->mm, pmd);
++				err = __pte_alloc(walk->mm, pmd, addr);
+ 			else if (ops->pte_hole)
+ 				err = ops->pte_hole(addr, next, depth, walk);
+ 			if (err)
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index d06453fa8..8c81c0b8a 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -789,7 +789,7 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
+ 
+ 		dst_pmdval = pmdp_get_lockless(dst_pmd);
+ 		if (unlikely(pmd_none(dst_pmdval)) &&
+-		    unlikely(__pte_alloc(dst_mm, dst_pmd))) {
++		    unlikely(__pte_alloc(dst_mm, dst_pmd, dst_addr))) {
+ 			err = -ENOMEM;
+ 			break;
+ 		}
+@@ -1813,13 +1813,13 @@ ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
+ 					err = -ENOENT;
+ 					break;
+ 				}
+-				if (unlikely(__pte_alloc(mm, src_pmd))) {
++				if (unlikely(__pte_alloc(mm, src_pmd, src_addr))) {
+ 					err = -ENOMEM;
+ 					break;
+ 				}
+ 			}
+ 
+-			if (unlikely(pte_alloc(mm, dst_pmd))) {
++			if (unlikely(pte_alloc(mm, dst_pmd, dst_addr))) {
+ 				err = -ENOMEM;
+ 				break;
+ 			}
+-- 
+2.34.1
+
